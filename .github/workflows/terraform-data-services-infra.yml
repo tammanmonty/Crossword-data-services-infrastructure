@@ -1,0 +1,123 @@
+name: Terraform - Deploy Infrastructure
+
+
+# This workflow is triggered on pushes to the develop and main branches, as well as pull requests targeting those branches. It runs Terraform commands to plan and apply infrastructure changes defined in the terraform/environments/dev directory. The workflow also comments the Terraform plan output on pull requests for review.
+# This will probably have to be tweaked once actual building for the applications takes place, but for now it serves as a good starting point for deploying the infrastructure components of the data services project.
+on:
+  push:
+    branches:
+      - develop
+      - main
+    paths:
+      - 'terraform/environments/**'
+      - 'terraform/modules/**'
+      - '.github/workflows/terraform-infrastructure.yml'
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths:
+      - 'terraform/environments/**'
+      - 'terraform/modules/**'
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.6.0
+  STATE_BUCKET: crossword-data-services-terraform-state-dev
+  LOCKS_TABLE: crossword-terraform-locks-dev
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::{AWS_ACCOUNT_NUMBER}:role/github-terraform-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: |
+          cd terraform/environments/dev
+          terraform fmt -check
+
+      - name: Terraform Init
+        run: |
+          cd terraform/environments/dev
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.LOCKS_TABLE }}"
+
+      - name: Terraform Validate
+        run: |
+          cd terraform/environments/dev
+          terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform/environments/dev
+          terraform plan -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('terraform/environments/dev/tfplan', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan\n\`\`\`\n${planOutput}\n\`\`\``
+            });
+
+  apply:
+    needs: plan
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::{AWS_ACCOUNT_NUMBER}:role/github-terraform-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          cd terraform/environments/dev
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ env.LOCKS_TABLE }}"
+
+      - name: Terraform Apply
+        run: |
+          cd terraform/environments/dev
+          terraform apply -auto-approve tfplan
